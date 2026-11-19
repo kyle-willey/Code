@@ -1,0 +1,188 @@
+/* ---------------------------------------------------------------------------------
+   Current inpatient line list: central lines, peripheral IVs, indwelling urinary catheters.
+
+   How it works:
+     1. params            - Tunable settings (see stale-device note below).
+     2. current_inpatient - Hospital encounters that are Admitted (ADT status 2), not
+                            discharged, and in an Inpatient class (Inpatient, Inpatient
+                            Rehab, Inpatient Mental Health, Inpatient Hospice).
+     3. current_location  - Latest non-canceled ADT location event (admit, transfer in,
+                            patient update, census) for each encounter gives the current
+                            unit, room, and bed. Encounters with no location event are
+                            stale records and drop out here.
+     4. active_device     - Epic LDAs (IP_LDA_NOADDSINGLE) for those patients that have
+                            been placed and have no removal date/time, classified as
+                            Central Line, Port-a-Cath, Peripheral IV, or Indwelling Urinary Catheter.
+                            Site label = orientation (Left/Right) + body site.
+     5. device_summary    - Per patient and type: count, sites, and days the oldest has
+                            been in place.
+     6. Final SELECT      - One row per patient with at least one qualifying device.
+
+   Definitions:
+     - Central line: CVC, PICC, hemodialysis catheter, introducer/PA catheter, cooling
+       catheter (adult and neo/peds rows). Midlines are peripheral and are excluded.
+     - Port-a-Cath: implanted ports (single and double lumen), reported in their own
+       columns rather than with the other central lines.
+     - Indwelling urinary catheter: urethral catheter only. Suprapubic, external
+       (PureWick) catheters, nephrostomies, and stents are excluded (NHSN convention).
+     - Stale-device note: some PIVs and urinary catheters from prior visits were never
+       charted as removed. PIVs and urinary catheters placed more than
+       stale_device_days before the current admission are treated as removed. Central
+       lines and ports are always kept because they legitimately persist.
+     - Data is as of the last Clarity load (daily, early morning).
+     - Room/bed are Epic record IDs; room/bed name tables are not available in Snowflake.
+   --------------------------------------------------------------------------------- */
+WITH params AS (
+    SELECT 30 AS stale_device_days
+),
+
+current_inpatient AS (
+    SELECT
+        hsp.PAT_ENC_CSN_ID_WS_PK                AS csn,
+        hsp.PAT_ID_WS                           AS pat_id,
+        hsp.HOSP_ADMSN_TIME_WS                  AS admit_time
+    FROM prod_gold.clarity_exploration.pat_enc_hsp_ws hsp
+    WHERE hsp.ADT_PATIENT_STAT_C_WS = 2                              -- Admitted
+      AND hsp.ADT_PAT_CLASS_C_WS IN ('101', '124', '127', '134')     -- Inpatient classes
+      AND hsp.HOSP_DISCH_TIME_WS IS NULL
+      AND hsp.HOSP_ADMSN_TIME_WS <= CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+),
+
+current_location AS (
+    SELECT
+        adt.PAT_ENC_CSN_ID_WS                   AS csn,
+        adt.DEPARTMENT_ID_WS                    AS department_id,
+        adt.ROOM_ID_WS                          AS room_id,
+        adt.BED_ID_WS                           AS bed_id,
+        adt.EFFECTIVE_TIME_WS                   AS location_since
+    FROM prod_gold.clarity_exploration.clarity_adt_ws adt
+    JOIN current_inpatient
+      ON current_inpatient.csn = adt.PAT_ENC_CSN_ID_WS
+    WHERE adt.EVENT_TYPE_C_WS IN (1, 3, 5, 6)                         -- Admit, Transfer In, Update, Census
+      AND COALESCE(adt.EVENT_SUBTYPE_C_WS, 1) <> 2                    -- not canceled
+      AND adt.DEPARTMENT_ID_WS IS NOT NULL
+      AND adt.EFFECTIVE_TIME_WS <= CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY adt.PAT_ENC_CSN_ID_WS
+                               ORDER BY adt.EFFECTIVE_TIME_WS DESC, adt.EVENT_ID_WS_PK DESC) = 1
+),
+
+active_device AS (
+    SELECT
+        current_inpatient.csn,
+        lda.IP_LDA_ID_WS_PK                     AS lda_id,
+        lda.PLACEMENT_INSTANT_WS                AS placement_time,
+        CASE
+            -- Ports are reported in their own columns, separate from other central lines.
+            WHEN flo.FLO_MEAS_NAME_WS ILIKE '%PORT A CATH%'
+                 THEN 'Port-a-Cath'
+            WHEN flo.FLO_MEAS_NAME_WS ILIKE ANY ('%CVC%', '%PICC%',
+                                                 '%HEMODIALYSIS CATH%', '%INTRODUCER%',
+                                                 '%COOLING CATH%', '%UMBILICAL%')
+                 THEN 'Central Line'
+            WHEN flo.FLO_MEAS_NAME_WS ILIKE '%PERIPHERAL IV%'
+                 THEN 'Peripheral IV'
+            WHEN flo.FLO_MEAS_NAME_WS ILIKE '%URETHRAL CATH%'
+                 THEN 'Indwelling Urinary Catheter'
+        END                                     AS device_type,
+        -- Short device name, used to label central lines (e.g. "PICC: Left Basilic Vein").
+        CASE
+            WHEN flo.FLO_MEAS_NAME_WS ILIKE '%PICC%'              THEN 'PICC'
+            WHEN flo.FLO_MEAS_NAME_WS ILIKE '%CVC%'               THEN 'CVC'
+            WHEN flo.FLO_MEAS_NAME_WS ILIKE '%HEMODIALYSIS CATH%' THEN 'HD Catheter'
+            WHEN flo.FLO_MEAS_NAME_WS ILIKE '%INTRODUCER%'        THEN 'Introducer'
+            WHEN flo.FLO_MEAS_NAME_WS ILIKE '%COOLING CATH%'      THEN 'Cooling Catheter'
+            WHEN flo.FLO_MEAS_NAME_WS ILIKE '%UMBILICAL%'         THEN 'Umbilical'
+        END                                     AS device_name,
+        TRIM(COALESCE(REPLACE(REGEXP_SUBSTR(lda.PROPERTIES_DISPLAY_WS,
+                                            'Orientation: ([A-Za-z;]+)', 1, 1, 'e', 1), ';', ' ') || ' ', '')
+             || COALESCE(lda.SITE_WS, ''))      AS body_site,
+        lda.DESCRIPTION_WS                      AS description
+    FROM prod_gold.clarity_exploration.ip_lda_noaddsingle_ws lda
+    JOIN current_inpatient
+      ON current_inpatient.pat_id = lda.PAT_ID_WS
+    JOIN prod_gold.clarity_exploration.ip_flo_gp_data_ws flo
+      ON flo.FLO_MEAS_ID_WS_PK = lda.FLO_MEAS_ID_WS
+    CROSS JOIN params
+    WHERE lda.PLACEMENT_INSTANT_WS <= CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+      -- Still in place: no charted removal (REMOVAL_INSTANT holds a far-future placeholder).
+      AND lda.REMOVAL_DTTM_WS IS NULL
+      AND (lda.REMOVAL_INSTANT_WS IS NULL OR lda.REMOVAL_INSTANT_WS > CURRENT_TIMESTAMP()::TIMESTAMP_NTZ)
+      AND flo.FLO_MEAS_NAME_WS ILIKE ANY ('%CVC%', '%PICC%', '%PORT A CATH%', '%HEMODIALYSIS CATH%',
+                                          '%INTRODUCER%', '%COOLING CATH%', '%UMBILICAL%',
+                                          '%PERIPHERAL IV%', '%URETHRAL CATH%')
+      -- Drop PIVs / urinary catheters left open from a prior visit (see stale-device note).
+      AND NOT (flo.FLO_MEAS_NAME_WS ILIKE ANY ('%PERIPHERAL IV%', '%URETHRAL CATH%')
+               AND lda.PLACEMENT_INSTANT_WS
+                   < DATEADD('day', -params.stale_device_days, current_inpatient.admit_time))
+),
+
+device_summary AS (
+    SELECT
+        active_device.csn,
+        active_device.device_type,
+        COUNT(*)                                                         AS device_count,
+        LISTAGG(CASE active_device.device_type
+                    WHEN 'Central Line'
+                         THEN active_device.device_name || ': ' || NULLIF(active_device.body_site, '')
+                    WHEN 'Indwelling Urinary Catheter'
+                         THEN active_device.description
+                    ELSE NULLIF(active_device.body_site, '')
+                END, '; ')
+            WITHIN GROUP (ORDER BY active_device.placement_time)         AS sites,
+        DATEDIFF('day', MIN(active_device.placement_time),
+                 CURRENT_TIMESTAMP()::TIMESTAMP_NTZ)                     AS oldest_days
+    FROM active_device
+    GROUP BY active_device.csn, active_device.device_type
+)
+
+SELECT
+    loc.LOC_NAME_WS                                                      AS Hospital,
+    dep.DEPARTMENT_NAME_WS                                               AS Unit,
+    current_location.room_id                                             AS Room_ID,
+    current_location.bed_id                                              AS Bed_ID,
+    patient.PAT_MRN_ID_WS                                                AS MRN,
+    current_inpatient.csn                                                AS CSN,
+    zc_sex.NAME_WS                                                       AS Gender,
+    DATEDIFF('year', patient.BIRTH_DATE_WS, CURRENT_DATE())
+        - IFF(TO_CHAR(CURRENT_DATE(), 'MMDD') < TO_CHAR(patient.BIRTH_DATE_WS, 'MMDD'), 1, 0)
+                                                                         AS Age,
+    current_inpatient.admit_time::DATE                                   AS Admit_Date,
+
+    COALESCE(central.device_count, 0)                                    AS Central_Line_Count,
+    central.sites                                                        AS Central_Line_Sites,
+    central.oldest_days                                                  AS Central_Line_Oldest_Days,
+
+    COALESCE(port.device_count, 0)                                       AS Port_A_Cath_Count,
+    port.sites                                                           AS Port_A_Cath_Sites,
+    port.oldest_days                                                     AS Port_A_Cath_Oldest_Days,
+
+    COALESCE(piv.device_count, 0)                                        AS PIV_Count,
+    piv.sites                                                            AS PIV_Sites,
+    piv.oldest_days                                                      AS PIV_Oldest_Days,
+
+    COALESCE(foley.device_count, 0)                                      AS Urinary_Catheter_Count,
+    foley.sites                                                          AS Urinary_Catheter_Details,
+    foley.oldest_days                                                    AS Urinary_Catheter_Oldest_Days
+FROM current_inpatient
+JOIN current_location
+  ON current_location.csn = current_inpatient.csn
+JOIN prod_gold.clarity_exploration.patient_ws patient
+  ON patient.PAT_ID_WS_PK = current_inpatient.pat_id
+LEFT JOIN prod_gold.clarity_exploration.zc_sex_ws zc_sex
+  ON zc_sex.RCPT_MEM_SEX_C_WS_PK = patient.SEX_C_WS
+LEFT JOIN prod_gold.clarity_exploration.clarity_dep_ws dep
+  ON dep.DEPARTMENT_ID_WS_PK = current_location.department_id
+LEFT JOIN prod_gold.clarity_exploration.clarity_loc_ws loc
+  ON loc.LOC_ID_WS_PK = dep.REV_LOC_ID_WS
+LEFT JOIN device_summary central
+  ON central.csn = current_inpatient.csn AND central.device_type = 'Central Line'
+LEFT JOIN device_summary port
+  ON port.csn = current_inpatient.csn AND port.device_type = 'Port-a-Cath'
+LEFT JOIN device_summary piv
+  ON piv.csn = current_inpatient.csn AND piv.device_type = 'Peripheral IV'
+LEFT JOIN device_summary foley
+  ON foley.csn = current_inpatient.csn AND foley.device_type = 'Indwelling Urinary Catheter'
+WHERE COALESCE(central.device_count, 0) + COALESCE(port.device_count, 0)
+      + COALESCE(piv.device_count, 0)
+      + COALESCE(foley.device_count, 0) > 0
+ORDER BY Hospital, Unit, Room_ID, Bed_ID;
