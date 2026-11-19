@@ -1,0 +1,498 @@
+USE [WarehousePRD_Rpt];
+GO
+
+/* ---------------------------------------------------------------------------------
+   Current inpatient line list:
+     - Central lines
+     - Port-a-Caths
+     - Peripheral IVs
+     - Indwelling urinary catheters
+
+   Environment:
+     Server:   DWHPRD
+     Database: WarehousePRD_Rpt
+     Schema:   FilteredAccess
+
+   Important:
+     This query assumes the FilteredAccess views retain the Clarity-style table and
+     column names used in the original Snowflake query. Object and column names may
+     require adjustment if the reporting views use different names.
+
+   How it works:
+     1. params
+        Defines the stale-device threshold.
+
+     2. current_inpatient
+        Identifies encounters that:
+          - Have an admitted ADT status
+          - Are in a qualifying inpatient class
+          - Do not have a discharge time
+          - Have an admission time no later than the current time
+
+     3. current_location_ranked/current_location
+        Finds the most recent non-canceled ADT location event for each encounter.
+
+     4. active_device_base/active_device
+        Identifies qualifying LDAs that:
+          - Have been placed
+          - Have not been removed
+          - Match one of the specified device categories
+
+     5. device_summary
+        Summarizes device count, sites/details, and age of the oldest device by
+        encounter and device category.
+
+     6. Final SELECT
+        Returns one row per current inpatient encounter with at least one qualifying
+        device.
+
+   Device definitions:
+     - Central Line:
+         CVC, PICC, hemodialysis catheter, introducer/PA catheter,
+         cooling catheter, or umbilical catheter.
+         Midlines are excluded unless the underlying LDA name also matches one of
+         the explicitly included patterns.
+
+     - Port-a-Cath:
+         Implanted ports reported separately from central lines.
+
+     - Peripheral IV:
+         LDAs whose flowsheet measure name contains "PERIPHERAL IV".
+
+     - Indwelling Urinary Catheter:
+         Urethral catheters only. Suprapubic, external/PureWick, nephrostomy,
+         and stent devices are not included.
+
+   Stale-device handling:
+     Peripheral IVs and urinary catheters placed more than 30 days before the
+     current admission are treated as stale and excluded. Central lines and ports
+     are retained because they may legitimately persist across encounters.
+   --------------------------------------------------------------------------------- */
+
+SET NOCOUNT ON;
+
+WITH params AS
+(
+    SELECT
+        CAST(30 AS int) AS stale_device_days
+),
+
+current_inpatient AS
+(
+    SELECT
+        hsp.PAT_ENC_CSN_ID_WS_PK AS csn,
+        hsp.PAT_ID_WS            AS pat_id,
+        hsp.HOSP_ADMSN_TIME_WS   AS admit_time
+    FROM [FilteredAccess].[PAT_ENC_HSP_WS] AS hsp
+    WHERE hsp.ADT_PATIENT_STAT_C_WS = 2
+      AND hsp.ADT_PAT_CLASS_C_WS IN ('101', '124', '127', '134')
+      AND hsp.HOSP_DISCH_TIME_WS IS NULL
+      AND hsp.HOSP_ADMSN_TIME_WS <= SYSDATETIME()
+),
+
+current_location_ranked AS
+(
+    SELECT
+        adt.PAT_ENC_CSN_ID_WS AS csn,
+        adt.DEPARTMENT_ID_WS  AS department_id,
+        adt.ROOM_ID_WS        AS room_id,
+        adt.BED_ID_WS         AS bed_id,
+        adt.EFFECTIVE_TIME_WS AS location_since,
+
+        ROW_NUMBER() OVER
+        (
+            PARTITION BY adt.PAT_ENC_CSN_ID_WS
+            ORDER BY
+                adt.EFFECTIVE_TIME_WS DESC,
+                adt.EVENT_ID_WS_PK DESC
+        ) AS location_rank
+    FROM [FilteredAccess].[CLARITY_ADT_WS] AS adt
+    INNER JOIN current_inpatient AS ci
+        ON ci.csn = adt.PAT_ENC_CSN_ID_WS
+    WHERE adt.EVENT_TYPE_C_WS IN (1, 3, 5, 6)
+      AND ISNULL(adt.EVENT_SUBTYPE_C_WS, 1) <> 2
+      AND adt.DEPARTMENT_ID_WS IS NOT NULL
+      AND adt.EFFECTIVE_TIME_WS <= SYSDATETIME()
+),
+
+current_location AS
+(
+    SELECT
+        clr.csn,
+        clr.department_id,
+        clr.room_id,
+        clr.bed_id,
+        clr.location_since
+    FROM current_location_ranked AS clr
+    WHERE clr.location_rank = 1
+),
+
+active_device_base AS
+(
+    SELECT
+        ci.csn,
+        lda.IP_LDA_ID_WS_PK      AS lda_id,
+        lda.PLACEMENT_INSTANT_WS AS placement_time,
+        flo.FLO_MEAS_NAME_WS     AS flow_measure_name,
+        lda.SITE_WS              AS documented_site,
+        lda.DESCRIPTION_WS       AS description,
+        lda.PROPERTIES_DISPLAY_WS,
+
+        CASE
+            WHEN UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%PORT A CATH%'
+                THEN 'Port-a-Cath'
+
+            WHEN UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%CVC%'
+              OR UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%PICC%'
+              OR UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%HEMODIALYSIS CATH%'
+              OR UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%INTRODUCER%'
+              OR UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%COOLING CATH%'
+              OR UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%UMBILICAL%'
+                THEN 'Central Line'
+
+            WHEN UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%PERIPHERAL IV%'
+                THEN 'Peripheral IV'
+
+            WHEN UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%URETHRAL CATH%'
+                THEN 'Indwelling Urinary Catheter'
+        END AS device_type,
+
+        CASE
+            WHEN UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%PICC%'
+                THEN 'PICC'
+
+            WHEN UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%CVC%'
+                THEN 'CVC'
+
+            WHEN UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%HEMODIALYSIS CATH%'
+                THEN 'HD Catheter'
+
+            WHEN UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%INTRODUCER%'
+                THEN 'Introducer'
+
+            WHEN UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%COOLING CATH%'
+                THEN 'Cooling Catheter'
+
+            WHEN UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%UMBILICAL%'
+                THEN 'Umbilical'
+        END AS device_name
+
+    FROM [FilteredAccess].[IP_LDA_NOADDSINGLE_WS] AS lda
+
+    INNER JOIN current_inpatient AS ci
+        ON ci.pat_id = lda.PAT_ID_WS
+
+    INNER JOIN [FilteredAccess].[IP_FLO_GP_DATA_WS] AS flo
+        ON flo.FLO_MEAS_ID_WS_PK = lda.FLO_MEAS_ID_WS
+
+    CROSS JOIN params AS p
+
+    WHERE lda.PLACEMENT_INSTANT_WS <= SYSDATETIME()
+
+      -- Device has no documented removal.
+      AND lda.REMOVAL_DTTM_WS IS NULL
+
+      -- REMOVAL_INSTANT_WS may contain a future placeholder date.
+      AND
+      (
+          lda.REMOVAL_INSTANT_WS IS NULL
+          OR lda.REMOVAL_INSTANT_WS > SYSDATETIME()
+      )
+
+      -- Qualifying device types.
+      AND
+      (
+             UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%CVC%'
+          OR UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%PICC%'
+          OR UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%PORT A CATH%'
+          OR UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%HEMODIALYSIS CATH%'
+          OR UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%INTRODUCER%'
+          OR UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%COOLING CATH%'
+          OR UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%UMBILICAL%'
+          OR UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%PERIPHERAL IV%'
+          OR UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%URETHRAL CATH%'
+      )
+
+      -- Exclude stale PIVs and urinary catheters carried forward from prior visits.
+      AND NOT
+      (
+          (
+                 UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%PERIPHERAL IV%'
+              OR UPPER(flo.FLO_MEAS_NAME_WS) LIKE '%URETHRAL CATH%'
+          )
+          AND lda.PLACEMENT_INSTANT_WS <
+              DATEADD(day, -p.stale_device_days, ci.admit_time)
+      )
+),
+
+active_device AS
+(
+    SELECT
+        adb.csn,
+        adb.lda_id,
+        adb.placement_time,
+        adb.device_type,
+        adb.device_name,
+
+        LTRIM
+        (
+            RTRIM
+            (
+                CONCAT
+                (
+                    CASE
+                        WHEN orientation.orientation_text IS NOT NULL
+                            THEN REPLACE(
+                                     REPLACE(
+                                         orientation.orientation_text,
+                                         ';',
+                                         ' '
+                                     ),
+                                     CHAR(13) + CHAR(10),
+                                     ' '
+                                 ) + ' '
+                        ELSE ''
+                    END,
+                    ISNULL(adb.documented_site, '')
+                )
+            )
+        ) AS body_site,
+
+        adb.description
+
+    FROM active_device_base AS adb
+
+    OUTER APPLY
+    (
+        SELECT
+            CASE
+                WHEN adb.PROPERTIES_DISPLAY_WS IS NOT NULL
+                 AND CHARINDEX(
+                         'Orientation: ',
+                         adb.PROPERTIES_DISPLAY_WS
+                     ) > 0
+                THEN
+                    SUBSTRING
+                    (
+                        adb.PROPERTIES_DISPLAY_WS,
+
+                        CHARINDEX(
+                            'Orientation: ',
+                            adb.PROPERTIES_DISPLAY_WS
+                        ) + LEN('Orientation: '),
+
+                        CASE
+                            WHEN CHARINDEX
+                                 (
+                                     CHAR(10),
+                                     adb.PROPERTIES_DISPLAY_WS,
+                                     CHARINDEX(
+                                         'Orientation: ',
+                                         adb.PROPERTIES_DISPLAY_WS
+                                     ) + LEN('Orientation: ')
+                                 ) > 0
+                            THEN
+                                CHARINDEX
+                                (
+                                    CHAR(10),
+                                    adb.PROPERTIES_DISPLAY_WS,
+                                    CHARINDEX(
+                                        'Orientation: ',
+                                        adb.PROPERTIES_DISPLAY_WS
+                                    ) + LEN('Orientation: ')
+                                )
+                                -
+                                (
+                                    CHARINDEX(
+                                        'Orientation: ',
+                                        adb.PROPERTIES_DISPLAY_WS
+                                    ) + LEN('Orientation: ')
+                                )
+
+                            WHEN CHARINDEX
+                                 (
+                                     '|',
+                                     adb.PROPERTIES_DISPLAY_WS,
+                                     CHARINDEX(
+                                         'Orientation: ',
+                                         adb.PROPERTIES_DISPLAY_WS
+                                     ) + LEN('Orientation: ')
+                                 ) > 0
+                            THEN
+                                CHARINDEX
+                                (
+                                    '|',
+                                    adb.PROPERTIES_DISPLAY_WS,
+                                    CHARINDEX(
+                                        'Orientation: ',
+                                        adb.PROPERTIES_DISPLAY_WS
+                                    ) + LEN('Orientation: ')
+                                )
+                                -
+                                (
+                                    CHARINDEX(
+                                        'Orientation: ',
+                                        adb.PROPERTIES_DISPLAY_WS
+                                    ) + LEN('Orientation: ')
+                                )
+
+                            ELSE
+                                LEN(adb.PROPERTIES_DISPLAY_WS)
+                                -
+                                (
+                                    CHARINDEX(
+                                        'Orientation: ',
+                                        adb.PROPERTIES_DISPLAY_WS
+                                    ) + LEN('Orientation: ')
+                                )
+                                + 1
+                        END
+                    )
+            END AS orientation_text
+    ) AS orientation
+),
+
+device_summary AS
+(
+    SELECT
+        ad.csn,
+        ad.device_type,
+        COUNT_BIG(*) AS device_count,
+
+        STRING_AGG
+        (
+            CAST
+            (
+                CASE ad.device_type
+                    WHEN 'Central Line'
+                    THEN
+                        CASE
+                            WHEN NULLIF(ad.body_site, '') IS NOT NULL
+                                THEN CONCAT(
+                                         ISNULL(ad.device_name, 'Central Line'),
+                                         ': ',
+                                         ad.body_site
+                                     )
+                            ELSE ISNULL(ad.device_name, 'Central Line')
+                        END
+
+                    WHEN 'Indwelling Urinary Catheter'
+                    THEN NULLIF(ad.description, '')
+
+                    ELSE NULLIF(ad.body_site, '')
+                END
+                AS varchar(max)
+            ),
+            '; '
+        ) WITHIN GROUP
+        (
+            ORDER BY ad.placement_time
+        ) AS sites,
+
+        DATEDIFF
+        (
+            day,
+            MIN(ad.placement_time),
+            SYSDATETIME()
+        ) AS oldest_days
+
+    FROM active_device AS ad
+    WHERE ad.device_type IS NOT NULL
+    GROUP BY
+        ad.csn,
+        ad.device_type
+)
+
+SELECT
+    loc.LOC_NAME_WS AS Hospital,
+    dep.DEPARTMENT_NAME_WS AS Unit,
+    cl.room_id AS Room_ID,
+    cl.bed_id AS Bed_ID,
+    patient.PAT_MRN_ID_WS AS MRN,
+    ci.csn AS CSN,
+    zc_sex.NAME_WS AS Gender,
+
+    DATEDIFF
+    (
+        year,
+        patient.BIRTH_DATE_WS,
+        CAST(GETDATE() AS date)
+    )
+    -
+    CASE
+        WHEN DATEADD
+             (
+                 year,
+                 DATEDIFF(
+                     year,
+                     patient.BIRTH_DATE_WS,
+                     CAST(GETDATE() AS date)
+                 ),
+                 patient.BIRTH_DATE_WS
+             ) > CAST(GETDATE() AS date)
+        THEN 1
+        ELSE 0
+    END AS Age,
+
+    CAST(ci.admit_time AS date) AS Admit_Date,
+
+    ISNULL(central.device_count, 0) AS Central_Line_Count,
+    central.sites AS Central_Line_Sites,
+    central.oldest_days AS Central_Line_Oldest_Days,
+
+    ISNULL(port.device_count, 0) AS Port_A_Cath_Count,
+    port.sites AS Port_A_Cath_Sites,
+    port.oldest_days AS Port_A_Cath_Oldest_Days,
+
+    ISNULL(piv.device_count, 0) AS PIV_Count,
+    piv.sites AS PIV_Sites,
+    piv.oldest_days AS PIV_Oldest_Days,
+
+    ISNULL(foley.device_count, 0) AS Urinary_Catheter_Count,
+    foley.sites AS Urinary_Catheter_Details,
+    foley.oldest_days AS Urinary_Catheter_Oldest_Days
+
+FROM current_inpatient AS ci
+
+INNER JOIN current_location AS cl
+    ON cl.csn = ci.csn
+
+INNER JOIN [FilteredAccess].[PATIENT_WS] AS patient
+    ON patient.PAT_ID_WS_PK = ci.pat_id
+
+LEFT JOIN [FilteredAccess].[ZC_SEX_WS] AS zc_sex
+    ON zc_sex.RCPT_MEM_SEX_C_WS_PK = patient.SEX_C_WS
+
+LEFT JOIN [FilteredAccess].[CLARITY_DEP_WS] AS dep
+    ON dep.DEPARTMENT_ID_WS_PK = cl.department_id
+
+LEFT JOIN [FilteredAccess].[CLARITY_LOC_WS] AS loc
+    ON loc.LOC_ID_WS_PK = dep.REV_LOC_ID_WS
+
+LEFT JOIN device_summary AS central
+    ON central.csn = ci.csn
+   AND central.device_type = 'Central Line'
+
+LEFT JOIN device_summary AS port
+    ON port.csn = ci.csn
+   AND port.device_type = 'Port-a-Cath'
+
+LEFT JOIN device_summary AS piv
+    ON piv.csn = ci.csn
+   AND piv.device_type = 'Peripheral IV'
+
+LEFT JOIN device_summary AS foley
+    ON foley.csn = ci.csn
+   AND foley.device_type = 'Indwelling Urinary Catheter'
+
+WHERE
+      ISNULL(central.device_count, 0)
+    + ISNULL(port.device_count, 0)
+    + ISNULL(piv.device_count, 0)
+    + ISNULL(foley.device_count, 0) > 0
+
+ORDER BY
+    Hospital,
+    Unit,
+    Room_ID,
+    Bed_ID;
